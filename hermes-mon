@@ -1,0 +1,2210 @@
+#!/usr/bin/env python3
+"""hermes-mon — live terminal monitor for a Hermes Agent kanban board.
+
+Shows, in a single terminal and without touching the gateway:
+
+  · how many cards there are and in which state (planned, ready, running…),
+  · which profile owns each one,
+  · the log of every worker running RIGHT NOW, auto-tailed,
+  · which Hermes instances are alive on the machine (gateway, dashboard,
+    workers, chat sessions), with their PID and profile,
+  · and whether anyone is actually dispatching — the failure mode that
+    silently stalls a board for hours.
+
+Panes follow the work: when a card finishes its pane disappears, when another
+one starts its pane shows up. Several cards running at once share the screen.
+
+Everything is read-only: the board database is opened with `mode=ro` and the
+worker logs are followed by offset, like `tail -f`. Nothing is ever written.
+
+Usage:
+    hermes-mon                 # monitor the active board
+    hermes-mon --pick          # choose the board first
+    hermes-mon --profile foo   # only cards owned by profile `foo`
+    hermes-mon --snapshot      # print one frame as plain text and exit
+
+Requires Python 3.10+ and a Linux /proc. No third-party dependencies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import os
+import re
+import sqlite3
+import time
+import unicodedata
+from collections import deque
+from pathlib import Path
+
+VERSION = "0.4.0"
+
+# ── Board states (hermes_cli/kanban_db.py: VALID_STATUSES) ───────────────
+RUNNING = "running"
+# Display order in the sidebar. done/archived come last.
+STATUS_ORDER = ("running", "review", "ready", "todo", "scheduled", "blocked", "triage")
+TERMINAL_STATUSES = ("done", "archived")
+# Cards that still have work ahead of them — what the header calls "planned".
+PENDING_STATUSES = ("ready", "todo", "scheduled", "triage")
+
+GLYPH = {
+    "running": "●", "review": "◐", "ready": "◆", "todo": "◻",
+    "scheduled": "⏱", "blocked": "■", "triage": "?",
+    "done": "✓", "archived": "·",
+}
+# One colour per state so the board reads at a glance. `ready` is cyan rather
+# than green on purpose: green belongs to `done`, and two greens would defeat
+# the point.
+STYLE_BY_STATUS = {
+    "running": "run",        # amber: happening now
+    "done": "ok",            # green: delivered
+    "ready": "accent2",      # gold: queued for the dispatcher
+    "todo": "info",          # cyan: planned — same colour as the header chip
+    "review": "review",      # magenta: awaiting review
+    "scheduled": "dim", "blocked": "bad", "triage": "warn", "archived": "dim",
+}
+# `todo` is Hermes' internal name; on screen it is what the header counts as
+# planned, so it says planned and wears the same colour.
+STATUS_LABEL = {"todo": "planned"}
+
+INITIAL_TAIL_BYTES = 96 * 1024   # how much log to read when attaching to a card
+MAX_BUFFER_LINES = 4000          # lines kept in memory per card
+MAX_PARTIAL = 1 << 16            # cap on a single line with no newline yet
+MIN_PANE_HEIGHT = 5              # header + 4 log lines
+TOKEN_WINDOW = 60.0              # seconds in the rolling tok/s average
+TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{6,}\b")
+
+
+# ── Terminal width ───────────────────────────────────────────────────────
+def _char_width(ch: str) -> int:
+    """Rough cell width. Box drawing and arrows in Hermes logs are 1 cell,
+    emoji are 2, and the variation selector takes none."""
+    if ch == "️" or unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def display_width(text: str) -> int:
+    return sum(_char_width(c) for c in text)
+
+
+def truncate(text: str, width: int, ellipsis: str = "…") -> str:
+    """Clip to `width` cells, with an ellipsis when it does not fit."""
+    if width <= 0:
+        return ""
+    if display_width(text) <= width:
+        return text
+    out, used = [], 0
+    limit = width - display_width(ellipsis)
+    for ch in text:
+        w = _char_width(ch)
+        if used + w > limit:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + ellipsis
+
+
+def wrap(text: str, width: int) -> list[str]:
+    """Split a line into `width`-cell chunks. No word wrapping: this is a log,
+    not prose, and breaking on words would wreck the ASCII boxes."""
+    if width <= 0 or not text:
+        return [""]
+    rows, cur, used = [], [], 0
+    for ch in text:
+        w = _char_width(ch)
+        if used + w > width:
+            rows.append("".join(cur))
+            cur, used = [ch], w
+        else:
+            cur.append(ch)
+            used += w
+    rows.append("".join(cur))
+    return rows
+
+
+def fmt_elapsed(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "—"
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
+def fmt_tokens(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.0f}k"
+    return f"{n / 1_000_000:.2f}M"
+
+
+def system_load() -> tuple[float | None, float | None, float | None]:
+    """(load as % of cores, GiB used, GiB total). None when unavailable."""
+    pct = used = total = None
+    try:
+        with open("/proc/loadavg") as fh:
+            one = float(fh.readline().split()[0])
+        pct = 100.0 * one / (os.cpu_count() or 1)
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        vals: dict[str, int] = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                key, _, value = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    vals[key] = int(value.split()[0])
+                if len(vals) == 2:
+                    break
+        total = vals["MemTotal"] / 1048576
+        used = total - vals["MemAvailable"] / 1048576
+    except (OSError, ValueError, KeyError):
+        pass
+    return pct, used, total
+
+
+# ── Board paths (mirrors hermes_cli/kanban_db.py) ────────────────────────
+def kanban_root() -> Path:
+    """HERMES_KANBAN_HOME, else ~/.hermes. Note the board is shared across
+    profiles by design, so it does NOT hang off the active profile."""
+    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if home:
+        # A profile's HERMES_HOME points at profiles/<name>; the board lives
+        # at the root of the tree.
+        path = Path(home).expanduser()
+        return path.parent.parent if path.parent.name == "profiles" else path
+    return Path.home() / ".hermes"
+
+
+def current_board(root: Path) -> str:
+    env = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if env:
+        return env
+    try:
+        slug = (root / "kanban" / "current").read_text(encoding="utf-8").strip()
+        if slug:
+            return slug
+    except OSError:
+        pass
+    return "default"
+
+
+def board_paths(board: str | None) -> tuple[str, Path, Path]:
+    """(slug, kanban.db, log dir). The `default` board keeps the inherited
+    layout: <root>/kanban.db and <root>/kanban/logs."""
+    root = kanban_root()
+    slug = (board or current_board(root)).strip() or "default"
+    if slug == "default":
+        return slug, root / "kanban.db", root / "kanban" / "logs"
+    base = root / "kanban" / "boards" / slug
+    return slug, base / "kanban.db", base / "logs"
+
+
+# ── Hermes instances alive on this machine ───────────────────────────────
+# Several Hermes processes coexisting is normal: the gateway, the dashboard,
+# one worker per running card, and chat sessions. They all share the same
+# board, so without this you cannot tell WHO is writing a given log.
+class Instance:
+    __slots__ = ("pid", "kind", "profile", "task_id", "age", "argv", "board", "db")
+
+    def __init__(self, pid: int, kind: str, profile: str, task_id: str, age: float,
+                 argv: str, board: str = "", db: str = ""):
+        self.pid = pid
+        self.kind = kind
+        self.profile = profile
+        self.task_id = task_id
+        self.age = age
+        self.argv = argv
+        self.board = board          # board it works on, when it declares one
+        self.db = db                # kanban.db it has pinned
+
+
+KIND_GLYPH = {"gateway": "⬢", "worker": "▶", "dashboard": "▤",
+              "dispatch": "↻", "chat": "◈", "cli": "◈", "other": "·"}
+
+
+def proc_hermes_env(pid: int) -> dict[str, str]:
+    """HERMES_* variables of a process. Hermes injects HERMES_PROFILE,
+    HERMES_KANBAN_BOARD and HERMES_KANBAN_DB into every worker, so this beats
+    guessing the profile from the command line."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return {}                   # another user's process: never mind
+    out: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, _, value = item.partition(b"=")
+        name = key.decode("utf-8", "replace")
+        if name.startswith("HERMES_"):
+            out[name] = value.decode("utf-8", "replace")
+    return out
+
+
+def proc_age(pid: int, uptime: float, clk: int) -> float:
+    """Process age in seconds, via starttime in /proc/<pid>/stat."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read().decode("utf-8", "replace")
+        # comm can contain spaces and parentheses: cut at the last ')'
+        fields = data[data.rindex(")") + 2:].split()
+        return max(0.0, uptime - float(fields[19]) / clk)
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def active_profile(root: Path) -> str:
+    """Profile a bare `hermes` would use. Without this, every process started
+    with no -p flag looks like it belongs to `default`."""
+    try:
+        name = (root / "active_profile").read_text(encoding="utf-8").strip()
+        return name or "default"
+    except OSError:
+        return "default"
+
+
+def session_start(session_id: str) -> float | None:
+    """Sessions are named <YYYYMMDD>_<HHMMSS>_<rand>, so the id carries the
+    moment the session began. That is what lets a session be matched to the
+    process running it — they start within a second of each other."""
+    match = re.match(r"(\d{8})_(\d{6})", session_id or "")
+    if not match:
+        return None
+    try:
+        return time.mktime(time.strptime(match.group(1) + match.group(2), "%Y%m%d%H%M%S"))
+    except ValueError:
+        return None
+
+
+def scan_instances() -> list[Instance]:
+    """Live Hermes processes, classified. Returns [] off Linux."""
+    if not os.path.isdir("/proc"):
+        return []
+    try:
+        clk = os.sysconf("SC_CLK_TCK") or 100
+    except (ValueError, OSError):
+        clk = 100
+    try:
+        with open("/proc/uptime") as fh:
+            uptime = float(fh.readline().split()[0])
+    except (OSError, ValueError):
+        uptime = 0.0
+
+    found: list[Instance] = []
+    self_pid = os.getpid()
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+        joined = " ".join(argv)
+        if "hermes-mon" in joined:
+            continue
+        if "hermes-agent" not in joined and "/bin/hermes" not in joined:
+            continue
+
+        # A card's worker arrives as  chat -q "work kanban task t_xxxx": the
+        # goal is ONE argument, so the whole line has to be searched rather
+        # than the individual tokens.
+        task_id = ""
+        worker = re.search(r"\bkanban task (\S+)", joined)
+        if worker:
+            kind = "worker"
+            task_id = worker.group(1)
+        elif "gateway" in argv:
+            kind = "gateway"
+        elif "dashboard" in argv or "web" in argv:
+            kind = "dashboard"
+        elif "dispatch" in joined:
+            kind = "dispatch"
+        elif "chat" in argv:
+            kind = "chat"
+        elif argv[-1].endswith("/hermes") or argv[-1] == "hermes":
+            kind = "cli"            # bare `hermes`: interactive session
+        else:
+            kind = "other"
+
+        # Profile, most reliable source first: the injected variable, then an
+        # explicit flag, then the HERMES_HOME the process was given (that is
+        # how the systemd gateway declares it), and only then the active
+        # profile a bare `hermes` would pick up.
+        env = proc_hermes_env(pid)
+        profile = env.get("HERMES_PROFILE", "")
+        if not profile:
+            for flag in ("-p", "--profile"):
+                if flag in argv:
+                    try:
+                        profile = argv[argv.index(flag) + 1]
+                        break
+                    except IndexError:
+                        pass
+        if not profile:
+            home = env.get("HERMES_HOME", "").strip()
+            if home:
+                hp = Path(home)
+                profile = hp.name if hp.parent.name == "profiles" else "default"
+        if not profile:
+            profile = active_profile(kanban_root())
+        db = env.get("HERMES_KANBAN_DB", "")
+        board = env.get("HERMES_KANBAN_BOARD", "")
+        if not board and db:
+            # <root>/kanban/boards/<slug>/kanban.db → slug; <root>/kanban.db → default
+            parent = Path(db).parent
+            board = parent.name if parent.parent.name == "boards" else "default"
+        found.append(Instance(pid, kind, profile, task_id,
+                              proc_age(pid, uptime, clk), joined, board, db))
+
+    order = {"gateway": 0, "dispatch": 1, "worker": 2, "chat": 3, "cli": 4,
+             "dashboard": 5, "other": 6}
+    found.sort(key=lambda i: (order.get(i.kind, 9), -i.age))
+    return found
+
+
+def flock_holders(path: Path) -> list[int]:
+    """PIDs holding a flock on `path`, read from /proc/locks.
+
+    It looks, it does NOT touch: trying to grab the lock to test it would open
+    a window where a starting gateway sees it contended and turns its
+    dispatcher off for good (see dispatcher_pid)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    out: list[int] = []
+    try:
+        with open("/proc/locks") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) < 6 or fields[1] != "FLOCK":
+                    continue
+                parts = fields[5].split(":")
+                if len(parts) != 3:
+                    continue
+                try:
+                    major, minor = int(parts[0], 16), int(parts[1], 16)
+                    inode, pid = int(parts[2]), int(fields[4])
+                except ValueError:
+                    continue
+                if inode != st.st_ino:
+                    continue
+                # Some filesystems report 00:00 as the device.
+                if (major, minor) in ((os.major(st.st_dev), os.minor(st.st_dev)), (0, 0)):
+                    out.append(pid)
+    except OSError:
+        return []
+    return sorted(set(out))
+
+
+def dispatcher_pid(root: Path) -> int | None:
+    """PID of the gateway currently dispatching cards, or None if nobody is.
+
+    A gateway decides ONCE, at startup, whether to take this lock; if it finds
+    it contended it gives up dispatching for the rest of its life (see
+    gateway/kanban_watchers.py: "this gateway will NOT dispatch"). So when the
+    holder dies, the survivor does NOT take over and cards sit in `ready`
+    forever. This watchdog exists for exactly that."""
+    holders = flock_holders(root / "kanban" / ".dispatcher.lock")
+    return holders[0] if holders else None
+
+
+def pid_alive(pid: int | None) -> bool:
+    return bool(pid) and os.path.isdir(f"/proc/{pid}")
+
+
+# ── Board discovery (for the startup picker) ─────────────────────────────
+class BoardChoice:
+    """A monitorable board: its database, its logs and who is attached."""
+    __slots__ = ("slug", "root", "db", "logs", "counts", "instances")
+
+    def __init__(self, slug: str, root: Path, db: Path, logs: Path):
+        self.slug = slug
+        self.root = root
+        self.db = db
+        self.logs = logs
+        self.counts: dict[str, int] = {}
+        self.instances: list[Instance] = []
+
+    @property
+    def running(self) -> int:
+        return self.counts.get("running", 0)
+
+    @property
+    def pending(self) -> int:
+        return sum(self.counts.get(st, 0) for st in PENDING_STATUSES)
+
+
+def board_counts(db: Path) -> dict[str, int]:
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return {}
+    try:
+        return {r[0]: r[1] for r in
+                conn.execute("select status, count(*) from tasks group by status")}
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
+
+def board_creators(db: Path) -> dict[str, int]:
+    """{creating session id: number of cards} for a board. This is how the
+    work splits between the Hermes instances that ordered it."""
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return {}
+    try:
+        return {r[0]: r[1] for r in conn.execute(
+            "select session_id, count(*) from tasks where session_id is not null "
+            "and session_id <> '' group by session_id") if r[0]}
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
+
+def discover_boards(instances: list[Instance]) -> list[BoardChoice]:
+    """Visible boards: the default tree, its named boards, and any tree the
+    live instances declare (another HERMES_KANBAN_HOME).
+
+    Careful: profiles share a board ON PURPOSE, so this usually returns a
+    single entry and there is nothing to choose."""
+    roots: list[Path] = [kanban_root()]
+    for inst in instances:
+        if not inst.db:
+            continue
+        db = Path(inst.db)
+        root = db.parents[2] if db.parent.parent.name == "boards" else db.parent
+        if root not in roots:
+            roots.append(root)
+
+    found: list[BoardChoice] = []
+    seen: set[Path] = set()
+    for root in roots:
+        candidates = [("default", root / "kanban.db", root / "kanban" / "logs")]
+        try:
+            for entry in sorted((root / "kanban" / "boards").iterdir()):
+                if entry.is_dir() and (entry / "kanban.db").exists():
+                    candidates.append((entry.name, entry / "kanban.db", entry / "logs"))
+        except OSError:
+            pass
+        for slug, db, logs in candidates:
+            if not db.exists() or db in seen:
+                continue
+            seen.add(db)
+            choice = BoardChoice(slug, root, db, logs)
+            choice.counts = board_counts(db)
+            choice.instances = [i for i in instances
+                                if (i.db and Path(i.db) == db)
+                                or (not i.db and slug == "default" and root == kanban_root())]
+            found.append(choice)
+    found.sort(key=lambda b: (-b.running, -b.pending, b.slug))
+    return found
+
+
+# ── Contexts: one Hermes "instance" as far as the operator cares ─────────
+# A board is shared between profiles BY DESIGN, so "two Hermes working on
+# different cards" is really one board with cards owned by different profiles.
+# These are the three separations that exist in the data, and each one is a
+# context you can switch to and watch on its own:
+#
+#   · a board (its cards, its workers, its events) — a different tree or a
+#     named board is a genuinely separate Hermes,
+#   · a board scoped to one profile — what tells apart two profiles working
+#     the same board,
+#   · a standalone session (cli/tui/telegram/desktop) that never touches
+#     kanban and only exists as a transcript.
+class Context:
+    """One watchable Hermes "instance".
+
+    Two shapes, because those are the two that exist in the data:
+
+      · a SESSION — a CLI/TUI/Telegram conversation, plus every kanban card it
+        created (`tasks.session_id` records its author). This is what an
+        operator means by "that Hermes": the chat and the work it spawned.
+      · a BOARD — the whole board, whoever ordered it. Useful for the global
+        picture and for trees with no originating session around any more.
+    """
+    __slots__ = ("kind", "board", "session", "cards", "pid")
+
+    def __init__(self, kind: str, board=None, session=None, cards: int = 0,
+                 pid: int | None = None):
+        self.kind = kind                  # "board" | "session"
+        self.board = board                # BoardChoice
+        self.session = session            # SessionInfo
+        self.cards = cards                # cards this session created
+        self.pid = pid                    # live process running it, if any
+
+    @property
+    def key(self) -> str:
+        return (f"session:{self.session.key}" if self.kind == "session"
+                else f"board:{self.board.db}")
+
+    @property
+    def label(self) -> str:
+        if self.kind == "session":
+            return f"{self.session.source} @{self.session.profile}"
+        return f"board {self.board.slug}"
+
+    @property
+    def detail(self) -> str:
+        if self.kind == "session":
+            return self.session.title or self.session.id
+        return str(self.board.db)
+
+
+# ── Reading the board ────────────────────────────────────────────────────
+class Task:
+    __slots__ = ("id", "title", "status", "assignee", "started_at", "completed_at",
+                 "heartbeat", "failures", "run_id", "pid", "model", "error",
+                 "creator_session")
+
+    def __init__(self, row: sqlite3.Row):
+        self.id = row["id"]
+        self.title = row["title"] or ""
+        self.status = row["status"] or "?"
+        self.assignee = row["assignee"] or "—"
+        self.started_at = row["started_at"]
+        self.completed_at = row["completed_at"]
+        self.heartbeat = row["last_heartbeat_at"]
+        self.failures = row["consecutive_failures"] or 0
+        self.run_id = row["current_run_id"]
+        self.pid = row["worker_pid"]
+        self.model = row["model_override"] or ""
+        self.error = row["last_failure_error"] or ""
+        # The session that created the card: this is what ties a bunch of
+        # cards to the CLI/TUI instance that ordered the work.
+        self.creator_session = row["session_id"] or ""
+
+
+class BoardReader:
+    """Read-only queries against kanban.db. The connection is reopened on
+    failure: workers write through WAL and the file can rotate."""
+
+    def __init__(self, db_path: Path, include_done: bool = True,
+                 include_archived: bool = False):
+        self.db_path = db_path
+        self.include_done = include_done
+        self.include_archived = include_archived
+        self.conn: sqlite3.Connection | None = None
+        self.error = ""
+        self.last_event_id = 0
+
+    def _connect(self) -> sqlite3.Connection | None:
+        if self.conn is not None:
+            return self.conn
+        if not self.db_path.exists():
+            self.error = f"missing {self.db_path}"
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            self.conn = conn
+            self.error = ""
+        except sqlite3.Error as exc:
+            self.error = str(exc)
+            return None
+        return self.conn
+
+    def _reset(self) -> None:
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except sqlite3.Error:
+            pass
+        self.conn = None
+
+    def tasks(self) -> list[Task] | None:
+        conn = self._connect()
+        if conn is None:
+            return None
+        hidden = []
+        if not self.include_done:
+            hidden.append("'done'")
+        if not self.include_archived:
+            hidden.append("'archived'")
+        where = f"where status not in ({','.join(hidden)})" if hidden else ""
+        try:
+            rows = conn.execute(
+                f"select * from tasks {where} order by "
+                "case status when 'running' then 0 when 'review' then 1 when 'ready' then 2 "
+                "when 'todo' then 3 when 'scheduled' then 4 when 'blocked' then 5 else 6 end, "
+                # Newest first inside each state: with a long history, today's
+                # work has to be the part you see without scrolling.
+                "coalesce(completed_at, started_at, created_at) desc"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            self.error = str(exc)
+            self._reset()
+            return None
+        self.error = ""
+        return [Task(r) for r in rows]
+
+    def terminal_counts(self, assignee: str | None = None) -> dict[str, int]:
+        """done/archived, which the list can hide. Counted separately so the
+        header can say how many there are instead of leaving the reader
+        wondering where they went."""
+        conn = self._connect()
+        if conn is None:
+            return {}
+        sql = "select status, count(*) from tasks where status in ('done','archived')"
+        args: list = []
+        if assignee:
+            sql += " and assignee = ?"
+            args.append(assignee)
+        try:
+            return {r[0]: r[1] for r in conn.execute(sql + " group by status", args)}
+        except sqlite3.Error:
+            self._reset()
+            return {}
+
+    def completed_runs(self) -> dict[str, tuple[float, float, int, bool]]:
+        """{card: (start, end, attempts, delivered)} for the attempt worth
+        showing: the one that completed the card, or failing that the last one
+        that ran to an end. A card's wall-clock includes aborted attempts and
+        crash loops, so the number worth comparing is a single run — and a card
+        that was requeued still has a previous run worth reporting."""
+        conn = self._connect()
+        if conn is None:
+            return {}
+        try:
+            rows = conn.execute(
+                "select task_id, started_at, ended_at, outcome from task_runs "
+                "order by id").fetchall()
+        except sqlite3.Error:
+            self._reset()
+            return {}
+        attempts: dict[str, int] = {}
+        best: dict[str, tuple[float, float, int, bool]] = {}
+        for row in rows:
+            task = row["task_id"]
+            attempts[task] = attempts.get(task, 0) + 1
+            if not (row["started_at"] and row["ended_at"]):
+                continue
+            delivered = row["outcome"] == "completed"
+            previous = best.get(task)
+            # A completed run always wins; otherwise keep the latest one.
+            if previous is None or delivered or not previous[3]:
+                best[task] = (row["started_at"], row["ended_at"], attempts[task], delivered)
+        return best
+
+    def new_events(self, limit: int = 200, skip_heartbeat: bool = True) -> list[sqlite3.Row]:
+        conn = self._connect()
+        if conn is None:
+            return []
+        filt = "and kind <> 'heartbeat'" if skip_heartbeat else ""
+        try:
+            if self.last_event_id == 0:
+                rows = conn.execute(
+                    f"select * from (select id, task_id, kind, payload, created_at "
+                    f"from task_events where 1=1 {filt} order by id desc limit ?) order by id",
+                    (limit,)).fetchall()
+            else:
+                rows = conn.execute(
+                    f"select id, task_id, kind, payload, created_at from task_events "
+                    f"where id > ? {filt} order by id limit ?",
+                    (self.last_event_id, limit)).fetchall()
+        except sqlite3.Error:
+            self._reset()
+            return []
+        if rows:
+            self.last_event_id = rows[-1]["id"]
+        return rows
+
+
+# ── Token accounting ─────────────────────────────────────────────────────
+# Every kanban worker opens a session in ITS profile's state.db, with
+# source='kanban' and the card id in the title ("Work kanban task t_xxxx").
+# Counters advance when each API call closes, not while text streams: that is
+# why the rate is a rolling average and never claims to be instantaneous.
+class TokStat:
+    __slots__ = ("session_id", "inp", "out", "reasoning", "calls", "last_activity")
+
+    def __init__(self, session_id: str, inp: int, out: int, reasoning: int,
+                 calls: int, last_activity: float):
+        self.session_id = session_id
+        self.inp = inp
+        self.out = out
+        self.reasoning = reasoning
+        self.calls = calls
+        self.last_activity = last_activity
+
+
+class TokenReader:
+    """Per-card tokens, read from each involved profile's state.db."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.stats: dict[str, TokStat] = {}
+        # Per-attempt rows, so a finished card can be credited to the session
+        # that finished it instead of to the sum of every attempt.
+        self.attempts: dict[str, list[tuple[float, int, int]]] = {}
+        self.failed: set[str] = set()
+
+    def _db_for(self, profile: str) -> Path:
+        if profile in ("", "default", "—"):
+            return self.root / "state.db"
+        return self.root / "profiles" / profile / "state.db"
+
+    def refresh(self, profiles: set[str]) -> None:
+        """Rebuild the per-card totals.
+
+        A card can be worked more than once — reassigned to another profile,
+        retried after a crash — and each attempt opens its own session. Summing
+        them is the only honest total; keeping just one (whichever was read
+        last) reported the aborted attempt's tokens as if they were the whole
+        job. Every profile is scanned, not just the current assignees, because
+        an earlier attempt may live under a profile that owns nothing now."""
+        wanted = set(profiles) | {name for name, _ in self._all_dbs()}
+        totals: dict[str, TokStat] = {}
+        per_task: dict[str, list[tuple[float, int, int]]] = {}
+        for profile in wanted:
+            db = self._db_for(profile)
+            if not db.exists():
+                continue
+            try:
+                conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)
+            except sqlite3.Error:
+                self.failed.add(profile)
+                continue
+            try:
+                rows = conn.execute(
+                    "select id, title, input_tokens, output_tokens, reasoning_tokens, "
+                    "api_call_count, last_activity_at, started_at "
+                    "from sessions where source = 'kanban'").fetchall()
+            except sqlite3.Error:
+                self.failed.add(profile)
+                rows = []
+            finally:
+                conn.close()
+            for sid, title, inp, out, reas, calls, seen, began in rows:
+                match = TASK_ID_RE.search(title or "")
+                if not match:
+                    continue
+                key = match.group(0)
+                per_task.setdefault(key, []).append((began or 0.0, out or 0, calls or 0))
+                acc = totals.get(key)
+                if acc is None:
+                    totals[key] = TokStat(sid, inp or 0, out or 0, reas or 0,
+                                          calls or 0, seen or 0.0)
+                else:
+                    acc.inp += inp or 0
+                    acc.out += out or 0
+                    acc.reasoning += reas or 0
+                    acc.calls += calls or 0
+                    if (seen or 0.0) > acc.last_activity:
+                        acc.last_activity = seen or 0.0
+                        acc.session_id = sid          # the attempt in charge now
+        self.stats = totals
+        self.attempts = per_task
+
+    def attempt_near(self, task_id: str, when: float) -> tuple[int, int] | None:
+        """(output tokens, calls) of the session that started closest to
+        `when` — the run that delivered the card."""
+        rows = self.attempts.get(task_id) or []
+        best, gap = None, 300.0
+        for began, out, calls in rows:
+            if began and abs(began - when) <= gap:
+                best, gap = (out, calls), abs(began - when)
+        return best
+
+    def _all_dbs(self) -> list[tuple[str, Path]]:
+        out = [("default", self.root / "state.db")]
+        try:
+            for prof in sorted((self.root / "profiles").iterdir()):
+                if (prof / "state.db").exists():
+                    out.append((prof.name, prof / "state.db"))
+        except OSError:
+            pass
+        return out
+
+    def get(self, task_id: str) -> TokStat | None:
+        return self.stats.get(task_id)
+
+
+class RateTracker:
+    """Rolling tok/s average over a window. The counter moves in jumps (one
+    per API call), so without a window the number would be useless."""
+
+    def __init__(self, window: float = TOKEN_WINDOW):
+        self.window = window
+        self.samples: dict[str, deque[tuple[float, int]]] = {}
+
+    def push(self, key: str, value: int, now: float) -> None:
+        buf = self.samples.setdefault(key, deque())
+        if buf and buf[-1][1] == value and now - buf[-1][0] < 1.5:
+            return
+        buf.append((now, value))
+        while len(buf) > 2 and now - buf[0][0] > self.window:
+            buf.popleft()
+
+    def rate(self, key: str, now: float) -> float | None:
+        buf = self.samples.get(key)
+        if not buf or len(buf) < 2:
+            return None
+        dt = buf[-1][0] - buf[0][0]
+        if dt < 5.0:
+            return None
+        return max(0.0, (buf[-1][1] - buf[0][1]) / dt)
+
+    def drop(self, key: str) -> None:
+        self.samples.pop(key, None)
+
+
+# ── Sessions (everything Hermes does, kanban or not) ─────────────────────
+# A card's worker writes a log file, but a plain CLI/TUI/Telegram session does
+# not: its only trace is the `sessions` + `messages` tables of its profile.
+# Reading those is the way to watch an instance that never touches kanban.
+MAX_MSG_CHARS = 2000        # per message kept for display
+MAX_MSG_LINES = 6           # display rows one message may take before eliding
+SESSION_LIMIT_PER_DB = 12   # newest sessions pulled from each profile
+
+
+class SessionInfo:
+    __slots__ = ("db", "profile", "id", "source", "title", "msgs", "inp", "out",
+                 "last_activity", "model")
+
+    def __init__(self, db: Path, profile: str, row):
+        self.db = db
+        self.profile = profile
+        self.id = row["id"]
+        self.source = row["source"] or "?"
+        self.title = row["title"] or ""
+        self.msgs = row["message_count"] or 0
+        self.inp = row["input_tokens"] or 0
+        self.out = row["output_tokens"] or 0
+        self.last_activity = row["last_activity_at"] or row["started_at"] or 0
+        self.model = row["model"] or ""
+
+    @property
+    def key(self) -> str:
+        return f"{self.db}::{self.id}"
+
+
+class SessionReader:
+    """Recent sessions across every profile, newest activity first."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.sessions: list[SessionInfo] = []
+
+    def _dbs(self) -> list[tuple[str, Path]]:
+        out = [("default", self.root / "state.db")]
+        try:
+            for prof in sorted((self.root / "profiles").iterdir()):
+                db = prof / "state.db"
+                if db.exists():
+                    out.append((prof.name, db))
+        except OSError:
+            pass
+        return [(name, db) for name, db in out if db.exists()]
+
+    def refresh(self, limit: int = 60) -> None:
+        found: list[SessionInfo] = []
+        for profile, db in self._dbs():
+            try:
+                conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)
+                conn.row_factory = sqlite3.Row
+            except sqlite3.Error:
+                continue
+            try:
+                rows = conn.execute(
+                    "select id, source, title, message_count, input_tokens, output_tokens, "
+                    "last_activity_at, started_at, model from sessions "
+                    "order by coalesce(last_activity_at, started_at) desc limit ?",
+                    (SESSION_LIMIT_PER_DB,)).fetchall()
+            except sqlite3.Error:
+                rows = []
+            finally:
+                conn.close()
+            found.extend(SessionInfo(db, profile, r) for r in rows)
+        found.sort(key=lambda s: s.last_activity, reverse=True)
+        self.sessions = found[:limit]
+
+
+class MessageTail:
+    """Live transcript of one session, polled from its `messages` table.
+
+    Rows land when each message completes, so the conversation advances turn
+    by turn rather than character by character — unlike a worker log, which is
+    the raw stream. That is a property of the data, not a limitation here."""
+
+    def __init__(self, db: Path, session_id: str):
+        self.db = db
+        self.session_id = session_id
+        self.last_id = 0
+        self.items: deque[tuple[float, str, str, str]] = deque(maxlen=400)
+
+    def poll(self) -> None:
+        try:
+            conn = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True, timeout=0.5)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            return
+        try:
+            if self.last_id == 0:
+                rows = conn.execute(
+                    "select * from (select id, role, tool_name, timestamp, content "
+                    "from messages where session_id = ? order by id desc limit 80) order by id",
+                    (self.session_id,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "select id, role, tool_name, timestamp, content from messages "
+                    "where session_id = ? and id > ? order by id limit 80",
+                    (self.session_id, self.last_id)).fetchall()
+        except sqlite3.Error:
+            return
+        finally:
+            conn.close()
+        for row in rows:
+            self.last_id = max(self.last_id, row["id"])
+            content = (row["content"] or "").strip()
+            self.items.append((row["timestamp"] or 0.0, row["role"] or "?",
+                               row["tool_name"] or "", content[:MAX_MSG_CHARS]))
+
+
+# ── Following log files ──────────────────────────────────────────────────
+class LogTail:
+    """`tail -f` of one file, tolerant of rotation (worker_log_rotate_bytes)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.offset = 0
+        self.lines: deque[str] = deque(maxlen=MAX_BUFFER_LINES)
+        self.partial = b""
+        self.primed = False
+        self.exists = False
+        self.size = 0
+        self.last_change = 0.0
+
+    def poll(self) -> None:
+        try:
+            st = self.path.stat()
+        except OSError:
+            self.exists = False
+            return
+        self.exists = True
+        if not self.primed:
+            # On attach: start near the end, do not re-read megabytes of history.
+            self.offset = max(0, st.st_size - INITIAL_TAIL_BYTES)
+            self.primed = True
+        if st.st_size < self.offset:      # rotated or truncated
+            self.offset = 0
+            self.lines.clear()
+            self.partial = b""
+        if st.st_size == self.offset:
+            self.size = st.st_size
+            return
+        try:
+            with self.path.open("rb") as fh:
+                fh.seek(self.offset)
+                data = fh.read(st.st_size - self.offset)
+        except OSError:
+            return
+        self.offset += len(data)
+        self.size = st.st_size
+        self.last_change = time.time()
+        chunks = (self.partial + data).split(b"\n")
+        self.partial = chunks.pop()[-MAX_PARTIAL:]
+        for raw in chunks:
+            self.lines.append(raw.decode("utf-8", "replace").replace("\r", "").expandtabs(4))
+
+    def rendered(self, width: int, height: int, scroll: int = 0) -> list[str]:
+        """Last `height` rows wrapped to `width`, skipping `scroll` rows from
+        the bottom. Walked backwards so we never wrap 4000 lines per frame."""
+        if height <= 0:
+            return []
+        out: list[str] = []
+        want = height + max(0, scroll)
+        source = list(self.lines)
+        if self.partial:
+            source.append(self.partial.decode("utf-8", "replace").replace("\r", ""))
+        for line in reversed(source):
+            rows = wrap(line, width)
+            for row in reversed(rows):
+                out.append(row)
+                if len(out) >= want:
+                    break
+            if len(out) >= want:
+                break
+        out.reverse()
+        if scroll:
+            out = out[:len(out) - scroll] if scroll < len(out) else []
+        return out[-height:]
+
+
+# ── Painting ─────────────────────────────────────────────────────────────
+class Frame:
+    """The screen as rows of (text, style) segments. The same model paints to
+    curses and to plain text, which is what makes --snapshot the same code."""
+
+    def __init__(self, width: int, height: int):
+        self.width = width
+        self.height = height
+        self.rows: list[list[tuple[str, str]]] = [[] for _ in range(height)]
+
+    def put(self, y: int, segments: list[tuple[str, str]]) -> None:
+        """Set a row, clipped to the frame width. Clipping here rather than at
+        every call site means no panel can ever overflow the terminal."""
+        if not (0 <= y < self.height):
+            return
+        room = self.width
+        clipped: list[tuple[str, str]] = []
+        for text, style in segments:
+            if room <= 0:
+                break
+            piece = truncate(text, room, "")
+            if piece:
+                clipped.append((piece, style))
+                room -= display_width(piece)
+        self.rows[y] = clipped
+
+    def append(self, y: int, segments: list[tuple[str, str]]) -> None:
+        """Add segments to a row, clipped to what is left of the frame width.
+        Every panel must go through this (or `put`); appending to `rows`
+        directly is what let the sessions view overflow the terminal."""
+        if not (0 <= y < self.height):
+            return
+        room = self.width - display_width("".join(t for t, _ in self.rows[y]))
+        for text, style in segments:
+            if room <= 0:
+                break
+            piece = truncate(text, room, "")
+            if piece:
+                self.rows[y].append((piece, style))
+                room -= display_width(piece)
+
+    def pad_to(self, y: int, x: int) -> None:
+        """Pad with spaces up to column `x`. Panes are painted AFTER the
+        sidebar on the same row, so the gap is measured against what is
+        already there — never assumed."""
+        if not (0 <= y < self.height):
+            return
+        used = display_width("".join(t for t, _ in self.rows[y]))
+        if used < x:
+            self.rows[y].append((" " * (x - used), ""))
+
+    def as_text(self) -> str:
+        return "\n".join("".join(t for t, _ in row).rstrip() for row in self.rows)
+
+
+class Monitor:
+    def __init__(self, args, choice: BoardChoice | None = None):
+        if choice is not None:
+            self.slug, self.db_path, self.logs_dir = choice.slug, choice.db, choice.logs
+        else:
+            self.slug, self.db_path, self.logs_dir = board_paths(args.board)
+        self.reader = BoardReader(self.db_path, include_done=not args.no_done,
+                                  include_archived=args.archived)
+        self.interval = args.interval
+        self.root = kanban_root()
+        self.no_color = args.no_color or bool(os.environ.get("NO_COLOR"))
+
+        self.show_sidebar = not args.no_sidebar
+        # Processes are always scanned (contexts need them) but the panel is
+        # off until asked for, same as the event feed: the default screen is
+        # the work, not the plumbing.
+        self.scan_procs = not args.no_instances
+        self.show_instances = bool(getattr(args, "processes", False))
+        self.show_events = bool(getattr(args, "events", False))
+        self.show_tokens = not args.no_tokens
+        self.follow = True
+        self.zoom: int | None = None
+        self.focus = 0
+        self.status_msg = ""
+
+        self.tails: dict[str, LogTail] = {}
+        self.scroll: dict[str, int] = {}
+        self.events: deque[tuple[int, str, str, str]] = deque(maxlen=200)
+        self.tasks: list[Task] = []
+        self.counts: dict[str, int] = {}
+        self.done_counts: dict[str, int] = {}
+        self.finished_runs: dict[str, tuple[float, float, int]] = {}
+        self.profile_filter: str | None = args.profile
+        self.profiles: list[str] = []
+        self.instances: list[Instance] = []
+        self.dispatcher: int | None = None
+        self.tokens = TokenReader(self.root)
+        self.rates = RateTracker()
+        self.sessions = SessionReader(self.root)
+        self.msg_tails: dict[str, MessageTail] = {}
+        self._sessions_at = 0.0
+        # Context: what this screen is showing. Switching one replaces
+        # everything, so two Hermes never bleed into each other's view.
+        self.context = Context("board", board=BoardChoice(self.slug, self.root,
+                                                          self.db_path, self.logs_dir))
+        self.contexts: list[Context] = []
+        self.picker_open = False
+        self.chat_view = False        # inside a session: work logs vs transcript
+        self.picker_sel = 0
+        self.sidebar_scroll = 0
+        self._contexts_at = 0.0
+        self._instances_at = 0.0
+        self._dispatcher_at = 0.0
+        self._tokens_at = 0.0
+
+    # ---- data ----
+    def refresh(self) -> None:
+        now = time.time()
+        if self.context.kind == "session":
+            self._refresh_session(now)
+        else:
+            self._refresh_board(now)
+        if self.scan_procs and now - self._instances_at >= 3.0:
+            self.instances = scan_instances()
+            self._instances_at = now
+        if now - self._dispatcher_at >= 3.0:
+            self.dispatcher = dispatcher_pid(self.root)
+            self._dispatcher_at = now
+        if now - self._contexts_at >= 5.0 or not self.contexts:
+            self.sessions.refresh()
+            self.contexts = self.build_contexts()
+            self._contexts_at = now
+
+    def _refresh_session(self, now: float) -> None:
+        self._refresh_board(now)          # its cards, its logs, its events
+        info = self.context.session
+        tail = self.msg_tails.get(info.key)
+        if tail is None:
+            tail = self.msg_tails[info.key] = MessageTail(info.db, info.id)
+        tail.poll()
+        for candidate in self.sessions.sessions:   # keep counters fresh
+            if candidate.key == info.key:
+                self.context.session = candidate
+                break
+
+    def _refresh_board(self, now: float) -> None:
+        tasks = self.reader.tasks()
+        if tasks is not None:
+            self.profiles = sorted({t.assignee for t in tasks
+                                    if t.assignee and t.assignee != "—"})
+            if self.context.kind == "session":
+                sid = self.context.session.id
+                tasks = [t for t in tasks if t.creator_session == sid]
+            if self.profile_filter:
+                tasks = [t for t in tasks if t.assignee == self.profile_filter]
+            self.tasks = tasks
+        # Counts over the cards on screen: with a filter on, the header has to
+        # agree with the sidebar rather than with the whole board.
+        counts: dict[str, int] = {}
+        for task in self.tasks:
+            counts[task.status] = counts.get(task.status, 0) + 1
+        self.counts = counts
+        self.done_counts = self.reader.terminal_counts(self.profile_filter)
+        self.finished_runs = self.reader.completed_runs()
+
+        for row in self.reader.new_events():
+            self.events.append((row["created_at"], row["task_id"], row["kind"],
+                                (row["payload"] or "").strip()))
+
+        live = {t.id for t in self.tasks if t.status == RUNNING}
+        for task_id in live:
+            tail = self.tails.get(task_id)
+            if tail is None:
+                tail = self.tails[task_id] = LogTail(self.logs_dir / f"{task_id}.log")
+            tail.poll()
+        for gone in [k for k in self.tails if k not in live]:
+            del self.tails[gone]
+            self.scroll.pop(gone, None)
+            self.rates.drop(gone)
+
+        if self.show_tokens and now - self._tokens_at >= 2.0:
+            self.tokens.refresh({t.assignee for t in self.tasks})
+            self._tokens_at = now
+            total_out = 0
+            for task in self.tasks:
+                stat = self.tokens.get(task.id)
+                if stat:
+                    total_out += stat.out
+                    self.rates.push(task.id, stat.out, now)
+            self.rates.push("__board__", total_out, now)
+
+    def build_contexts(self) -> list[Context]:
+        """What can be watched on its own.
+
+        An instance is a session with a live process behind it, or one whose
+        cards are still on the board. Sessions whose process is gone and whose
+        work is finished are history, not instances, so they stay out.
+        Boards are listed apart: a board is not an instance, it is the whole
+        picture with every instance's work in it."""
+        instance_ctxs: list[Context] = []
+        board_ctxs: list[Context] = []
+        creators: dict[str, int] = {}
+        for choice in discover_boards(self.instances):
+            board_ctxs.append(Context("board", board=choice))
+            for sid, count in board_creators(choice.db).items():
+                creators[sid] = creators.get(sid, 0) + count
+
+        interactive = [i for i in self.instances if i.kind in ("cli", "chat", "tui")]
+        for info in self.sessions.sessions:
+            if info.source == "kanban":
+                continue                       # a worker is not an instance
+            cards = creators.get(info.id, 0)
+            pid = self._match_process(info, interactive)
+            if pid or cards:
+                instance_ctxs.append(Context("session", session=info, cards=cards, pid=pid))
+        instance_ctxs.sort(key=lambda c: (0 if c.pid else 1, -c.cards,
+                                          -c.session.last_activity))
+        return instance_ctxs + board_ctxs
+
+    @staticmethod
+    def _match_process(info, interactive: list[Instance]) -> int | None:
+        """Pair a session with the process running it by start time: a session
+        id encodes when it began and the process starts within a second of it.
+        The profile only breaks ties."""
+        began = session_start(info.id)
+        if began is None:
+            return None
+        now = time.time()
+        best, best_gap = None, 90.0
+        for inst in interactive:
+            gap = abs((now - inst.age) - began)
+            if gap <= best_gap or (gap <= 90 and inst.profile == info.profile and best is None):
+                best, best_gap = inst.pid, gap
+        return best
+
+    def switch_to(self, ctx: Context) -> None:
+        """Rebind everything to the new context. State from the previous one is
+        dropped on purpose: mixing two boards' logs was the whole complaint."""
+        self.context = ctx
+        self.profile_filter = None
+        self.sidebar_scroll = 0
+        self.zoom = None
+        self.focus = 0
+        self.tails.clear()
+        self.scroll.clear()
+        self.events.clear()
+        self.reader.last_event_id = 0
+        if ctx.kind == "board":
+            self.root = ctx.board.root
+            self.slug, self.db_path, self.logs_dir = (ctx.board.slug, ctx.board.db,
+                                                      ctx.board.logs)
+            self.reader = BoardReader(self.db_path,
+                                      include_done=self.reader.include_done,
+                                      include_archived=self.reader.include_archived)
+            self.tokens = TokenReader(self.root)
+            self.tails.clear()
+            self.scroll.clear()
+            self.events.clear()
+            self.rates = RateTracker()
+            self.tasks = []
+            self.counts = {}
+            self.zoom = None
+            self.focus = 0
+            self._tokens_at = 0.0
+        self.refresh()
+
+    def running(self) -> list[Task]:
+        return [t for t in self.tasks if t.status == RUNNING]
+
+    def gateways(self) -> list[Instance]:
+        return [i for i in self.instances if i.kind == "gateway"]
+
+    def instance_for(self, task: Task) -> Instance | None:
+        """The Hermes process running this card, if it is still alive."""
+        for inst in self.instances:
+            if inst.task_id and inst.task_id == task.id:
+                return inst
+            if task.pid and inst.pid == task.pid:
+                return inst
+        return None
+
+    def other_board(self, inst: Instance) -> str:
+        """That instance's board name when it is NOT the one on screen.
+
+        Boards are shared between profiles on purpose (kanban_home() does not
+        hang off the active profile), so normally every instance lands here.
+        One marked ✱ works on another board, or in another Hermes tree, and
+        its cards are not on this screen."""
+        if inst.db and Path(inst.db) != self.db_path:
+            name = inst.board or "default"
+            if name == self.slug:
+                # Same board NAME in a different tree (another
+                # HERMES_KANBAN_HOME): the name tells nothing, so identify it
+                # by its root.
+                db = Path(inst.db)
+                root = db.parents[2] if db.parent.parent.name == "boards" else db.parent
+                return root.name or str(root)
+            return name
+        if inst.board and inst.board != self.slug:
+            return inst.board
+        return ""
+
+    def card_rate(self, task: Task, stat: TokStat | None, now: float) -> str:
+        """A card's rate. Counters only move when an API call closes, so
+        between calls the window reads 0 even while text streams: in that case
+        fall back to the average since the card started, marked with ~ so the
+        number is not sold as something it is not."""
+        rate = self.rates.rate(task.id, now)
+        if rate:
+            return f"{rate:.0f}t/s"
+        if stat and stat.out and task.started_at and now > task.started_at:
+            return f"~{stat.out / (now - task.started_at):.0f}t/s"
+        return "" if rate is None else "0t/s"
+
+    def token_totals(self) -> tuple[int, int, int]:
+        """(input, output, calls) summed over visible cards. Input tokens are
+        cumulative per call — each call resends the context — so that number
+        grows far faster than the output one."""
+        inp = out = calls = 0
+        for task in self.tasks:
+            stat = self.tokens.get(task.id)
+            if stat:
+                inp += stat.inp
+                out += stat.out
+                calls += stat.calls
+        return inp, out, calls
+
+    # ---- layout ----
+    def build(self, width: int, height: int) -> Frame:
+        frame = Frame(width, height)
+        now = time.time()
+        running = self.running()
+
+        # Top bar: badge, board state, machine health.
+        pend = sum(self.counts.get(s, 0) for s in PENDING_STATUSES)
+        left: list[tuple[str, str]] = [(" HERMES-MON ", "badge"), ("  ", "")]
+        if self.context.kind == "session":
+            info = self.context.session
+            left.append((f"{info.source}@{info.profile}", "accent2"))
+            left.append((f" · {truncate(info.title or info.id, 28)}", "dim"))
+            if self.chat_view:
+                left.append(("  [chat]", "info"))
+        else:
+            left.append((f"board {self.slug}", "accent2"))
+        left.append(("   ● ", "run" if running else "dim"))
+        left.append((f"{len(running)} running", "run" if running else "dim"))
+        left.append((f"   ◆ {pend} planned", "info" if pend else "dim"))
+        hidden = 0
+        if not self.reader.include_done:
+            hidden += self.done_counts.get("done", 0)
+        if not self.reader.include_archived:
+            hidden += self.done_counts.get("archived", 0)
+        if hidden:
+            left.append((f"   ✓ {hidden} hidden", "ok"))
+        if self.counts.get("blocked"):
+            left.append((f"   ■ {self.counts['blocked']} blocked", "bad"))
+        if self.dispatcher is None:
+            waiting = sum(self.counts.get(st, 0) for st in ("ready", "running"))
+            left.append(("   ⚠ NO DISPATCHER", "bad" if waiting else "dim"))
+        if len(self.gateways()) > 1:
+            left.append((f"   ⚠ {len(self.gateways())} gateways", "bad"))
+        if self.profile_filter:
+            left.append((f"   only @{self.profile_filter}", "warn"))
+        if not self.follow:
+            left.append(("   ⏸ PAUSED", "warn"))
+
+        # Right-hand chips, most important last. When the terminal is too
+        # narrow they are dropped by priority instead of being cut mid-number.
+        groups: list[tuple[str, list[tuple[str, str]]]] = []
+        if self.show_tokens:
+            inp, out, _ = self.token_totals()
+            rate = self.rates.rate("__board__", now)
+            if rate is not None:
+                groups.append(("rate", [(f"{rate:.0f} tok/s", "accent" if rate else "dim"),
+                                        ("  ", "")]))
+            if inp or out:
+                groups.append(("tokens", [(f"↑{fmt_tokens(inp)} ", "dim"),
+                                          (f"↓{fmt_tokens(out)}", ""), ("  │  ", "rule")]))
+        pct, used, total = system_load()
+        if pct is not None:
+            groups.append(("load", [(f"load {pct:.0f}%",
+                                     "bad" if pct > 90 else ("warn" if pct > 60 else "dim")),
+                                    ("  ", "")]))
+        if used is not None and total:
+            groups.append(("mem", [(f"mem {used:.1f}/{total:.1f}G",
+                                    "warn" if used / total > 0.9 else "dim"), ("  │  ", "rule")]))
+        clock = [(time.strftime("%H:%M:%S "), "accent2")]
+
+        left_w = display_width("".join(t for t, _ in left))
+        budget = width - left_w - display_width(clock[0][0]) - 2
+        keep: list[str] = []
+        for name in ("rate", "tokens", "load", "mem"):     # priority order
+            group = next((g for n, g in groups if n == name), None)
+            if group is None:
+                continue
+            need = display_width("".join(t for t, _ in group))
+            if need <= budget:
+                keep.append(name)
+                budget -= need
+        right = [seg for name, group in groups if name in keep for seg in group] + clock
+
+        used_w = display_width("".join(t for t, _ in left) + "".join(t for t, _ in right))
+        frame.put(0, left + [(" " * max(1, width - used_w), "")] + right)
+        frame.put(1, [("─" * width, "rule")])
+
+        body_top = 2
+        body_bottom = height - 2                      # -1 for the key bar
+        ev_h = 0
+        if self.show_events and height >= 16:
+            ev_h = min(7, max(3, height // 6))
+            body_bottom -= ev_h + 1
+
+        if self.picker_open:
+            self._draw_picker(frame, width, height)
+            self._draw_keys(frame, height, width)
+            return frame
+
+        left_edge = 0
+        if self.show_sidebar and width >= 92 and self.tasks:
+            sb_w = 42 if width >= 130 else (36 if width >= 110 else 30)
+            sb_h = body_bottom - body_top + 1
+            inst_h = 0
+            if self.show_instances and self.instances and sb_h >= 12:
+                inst_h = min(len(self.instances) + 2, max(4, sb_h // 3))
+            self._draw_sidebar(frame, 0, body_top, sb_w, sb_h - inst_h, now)
+            if inst_h:
+                self._draw_instances(frame, body_bottom - inst_h + 1, sb_w, inst_h)
+            left_edge = sb_w + 1
+            for y in range(body_top, body_bottom + 1):
+                frame.pad_to(y, sb_w)
+                frame.append(y, [("│", "rule")])
+
+        if self.chat_view and self.context.kind == "session":
+            self._draw_transcript(frame, left_edge, body_top, width - left_edge,
+                                  body_bottom - body_top + 1, now)
+        else:
+            self._draw_panes(frame, left_edge, body_top, width - left_edge,
+                             body_bottom - body_top + 1, now)
+
+        if ev_h:
+            y0 = body_bottom + 2
+            frame.put(y0 - 1, [("─" * width, "rule")])
+            self._draw_events(frame, y0, ev_h, width)
+
+        self._draw_keys(frame, height, width)
+        return frame
+
+    def _card_rows(self, w: int, now: float) -> list[list[tuple[str, str]]]:
+        """Every card as three rows, blank row between state groups. Built in
+        full so the sidebar can be scrolled instead of silently cut."""
+        by_status: dict[str, list[Task]] = {}
+        for task in self.tasks:
+            by_status.setdefault(task.status, []).append(task)
+
+        rows: list[list[tuple[str, str]]] = []
+        for status in STATUS_ORDER + TERMINAL_STATUSES:
+            group = by_status.get(status)
+            if not group:
+                continue
+            style = STYLE_BY_STATUS.get(status, "")
+            for task in group:
+                short = task.id[2:10] if task.id.startswith("t_") else task.id[:8]
+                head = [(f" {short} ", "accent2"),
+                        (f"{GLYPH.get(status, '·')} {STATUS_LABEL.get(status, status)}", style)]
+                # Running cards show how long they have been at it; the rest,
+                # how long their run took. ↺ marks a run that did not deliver.
+                clock, mark, mark_style = "", "", "warn"
+                finished = self.finished_runs.get(task.id)
+                if status == RUNNING and task.started_at:
+                    clock = f"  ⏱ {fmt_elapsed(now - task.started_at)}"
+                elif finished:
+                    clock = f"  ⏱ {fmt_elapsed(finished[1] - finished[0])}"
+                    if not finished[3]:
+                        mark = " ↺"
+                    elif finished[2] > 1:
+                        mark = f" +{finished[2] - 1}"
+                elif task.completed_at and task.started_at:
+                    clock = f"  ⏱ {fmt_elapsed(task.completed_at - task.started_at)}"
+                if clock and display_width("".join(t for t, _ in head) + clock) <= w:
+                    head.append((clock, "dim"))
+                    if mark:
+                        head.append((mark, mark_style))
+                if task.failures:
+                    head.append((f"  ✖{task.failures}", "bad"))
+                rows.append(head)
+                rows.append([(" ", ""), (truncate(task.title, w - 1), "")])
+
+                foot = [(f" @{task.assignee}", "dim")]
+                if status == RUNNING and task.heartbeat:
+                    foot.append((f"  ♥ {fmt_elapsed(now - task.heartbeat)}", "dim"))
+                stat = self.tokens.get(task.id) if self.show_tokens else None
+                if stat and stat.out:
+                    tok = f"  ↓{fmt_tokens(stat.out)}"
+                    if status == RUNNING:
+                        rate = self.card_rate(task, stat, now)
+                    else:
+                        # Credit the run on screen, not the sum of every attempt.
+                        rate = ""
+                        if finished:
+                            span = finished[1] - finished[0]
+                            won = self.tokens.attempt_near(task.id, finished[0])
+                            if won and span > 0 and won[0]:
+                                tok = f"  ↓{fmt_tokens(won[0])}"
+                                rate = f"{won[0] / span:.0f}t/s"
+                    suffix = f" {rate}" if rate else ""
+                    used = display_width("".join(t for t, _ in foot))
+                    if used + display_width(tok + suffix) <= w:
+                        foot.append((tok, ""))
+                        if suffix:
+                            foot.append((suffix, "dim" if rate.startswith("~") else "run"))
+                    elif used + display_width(tok) <= w:
+                        foot.append((tok, ""))
+                rows.append(foot)
+            rows.append([])                      # blank row between groups
+        while rows and not rows[-1]:
+            rows.pop()
+        return rows
+
+    def _draw_sidebar(self, frame: Frame, x: int, y0: int, w: int, h: int, now: float) -> None:
+        """Cards grouped by state, newest first, scrollable with [ and ]."""
+        rows = self._card_rows(w, now)
+        body = max(1, h - 1)
+        max_scroll = max(0, len(rows) - body)
+        self.sidebar_scroll = min(self.sidebar_scroll, max_scroll)
+        offset = self.sidebar_scroll
+
+        title = " ▌ CARDS "
+        head = [(title, "title")]
+        if max_scroll:
+            marker = f" {offset + 1}-{min(offset + body, len(rows))}/{len(rows)} "
+            head.append(("─" * max(0, w - display_width(title + marker)), "rule"))
+            head.append((marker, "dim"))
+        else:
+            head.append(("─" * max(0, w - display_width(title)), "rule"))
+        frame.put(y0, head)
+
+        window = rows[offset:offset + body]
+        for i, row in enumerate(window):
+            frame.put(y0 + 1 + i, row if row else [("", "")])
+        if offset + body < len(rows):
+            frame.put(y0 + h - 1,
+                      [(truncate(f"   ↓ {len(rows) - offset - body} more rows  [ ]", w), "warn")])
+
+    def _draw_instances(self, frame: Frame, y0: int, w: int, h: int) -> None:
+        """Who is alive on this machine. With several Hermes processes around
+        (gateway, dashboard, workers, chats) this is the only way to tell them
+        apart: PID + role + profile, and workers carry their card. ⟲ marks the
+        one holding the dispatcher lock."""
+        frame.put(y0, [(" ▌ PROCESSES ", "title"), ("─" * max(0, w - 13), "rule")])
+        rows = self.instances[:h - 1]
+        for i, inst in enumerate(rows):
+            style = {"gateway": "accent", "worker": "run", "dashboard": "info",
+                     "dispatch": "accent2", "chat": "", "cli": ""}.get(inst.kind, "dim")
+            head = f" {KIND_GLYPH.get(inst.kind, '·')} {inst.pid:<6} {inst.kind}"
+            tail = f" @{inst.profile}"
+            if inst.task_id:
+                tail = f" {inst.task_id[2:10]}"
+            if inst.pid == self.dispatcher:
+                tail += " ⟲disp"
+            other = self.other_board(inst)
+            if other:
+                tail += f" ✱{other}"
+            frame.put(y0 + 1 + i, [(truncate(head, w - display_width(tail)), style),
+                                   (truncate(tail, w), "warn" if other else "dim")])
+        remaining = len(self.instances) - len(rows)
+        if remaining > 0 and h >= 2:
+            frame.put(y0 + h - 1, [(f"   … and {remaining} more", "dim")])
+
+    def _draw_panes(self, frame: Frame, x: int, y0: int, w: int, h: int, now: float) -> None:
+        running = self.running()
+        if self.zoom is not None and 0 <= self.zoom < len(running):
+            running = [running[self.zoom]]
+        if not running:
+            msg = "— no worker running —"
+            frame.pad_to(y0 + h // 2, x + max(0, (w - display_width(msg)) // 2))
+            frame.append(y0 + h // 2, [(msg, "dim")])
+            hint = "panes appear on their own as soon as the dispatcher starts a card"
+            if h > 3:
+                frame.pad_to(y0 + h // 2 + 2, x + max(0, (w - display_width(hint)) // 2))
+                frame.append(y0 + h // 2 + 2, [(hint, "dim")])
+            return
+
+        # Vertical split: one header plus its log per pane. When they do not
+        # all fit, show those that do and say how many are missing.
+        max_panes = max(1, h // MIN_PANE_HEIGHT)
+        hidden = max(0, len(running) - max_panes)
+        shown = running[:max_panes]
+        base, extra = divmod(h - (1 if hidden else 0), len(shown))
+        y = y0
+        for idx, task in enumerate(shown):
+            ph = base + (1 if idx < extra else 0)
+            self._draw_pane(frame, x, y, w, ph, task, idx, now)
+            y += ph
+        if hidden:
+            note = f"  … and {hidden} more worker(s) running — press [1-9] to see one full screen"
+            frame.pad_to(y, x)
+            frame.append(y, [(truncate(note, w), "warn")])
+
+    def _draw_pane(self, frame: Frame, x: int, y0: int, w: int, h: int,
+                   task: Task, idx: int, now: float) -> None:
+        tail = self.tails.get(task.id)
+        focused = (idx == self.focus) and self.zoom is None and len(self.running()) > 1
+        stat = self.tokens.get(task.id) if self.show_tokens else None
+
+        # The ✖ is only painted when the claimed PID is really gone: that is
+        # the zombie-card signal (live claim, dead worker), not "did not look".
+        inst = self.instance_for(task)
+        if inst:
+            who = f"pid {inst.pid}"
+        elif task.pid and pid_alive(task.pid):
+            who = f"pid {task.pid}"
+        elif task.pid:
+            who = f"pid {task.pid} ✖ dead"
+        else:
+            who = "no process"
+
+        elapsed = fmt_elapsed(now - task.started_at) if task.started_at else "—"
+        meta: list[tuple[str, str]] = [
+            (f" {idx + 1} ", "panehdrsel" if focused else "panehdr"),
+            (" ● ", "run"),
+            (truncate(task.title, max(12, w // 2)), "accent" if focused else ""),
+            ("  │ ", "rule"), (f"@{task.assignee}", "accent2"),
+            ("  │ ", "rule"), (who, "bad" if who.endswith("dead") else "dim"),
+            ("  │ ", "rule"), (f"⏱ {elapsed}", "dim"),
+        ]
+        if task.heartbeat:
+            meta += [("  │ ", "rule"), (f"♥ {fmt_elapsed(now - task.heartbeat)}", "dim")]
+        if stat:
+            rate = self.card_rate(task, stat, now)
+            meta += [("  │ ", "rule"),
+                     (f"↑{fmt_tokens(stat.inp)} ↓{fmt_tokens(stat.out)}", "dim")]
+            if rate:
+                meta += [("  ", ""), (rate, "dim" if rate.startswith("~") else "accent")]
+        elif tail and tail.exists:
+            meta += [("  │ ", "rule"), (fmt_bytes(tail.size), "dim")]
+
+        frame.pad_to(y0, x)
+        frame.append(y0, meta)
+
+        body_h = h - 1
+        if body_h <= 0:
+            return
+        if tail is None or not tail.exists:
+            frame.pad_to(y0 + 1, x)
+            frame.append(y0 + 1, [("  (the worker has not written its log yet)", "dim")])
+            return
+        lines = tail.rendered(w - 1, body_h, self.scroll.get(task.id, 0))
+        pad = body_h - len(lines)
+        for i, line in enumerate(lines):
+            row_y = y0 + 1 + pad + i
+            frame.pad_to(row_y, x + 1)
+            frame.append(row_y, [(line, "")])
+
+    def _draw_transcript(self, frame: Frame, x: int, y0: int, w: int, h: int,
+                         now: float) -> None:
+        """The conversation of the current session. Messages land when they
+        complete, so this advances turn by turn — unlike a worker log, which is
+        the raw stream."""
+        info = self.context.session
+        tail = self.msg_tails.get(info.key)
+        live = now - info.last_activity < 90 if info.last_activity else False
+        header = [(" ● ", "run" if live else "dim"),
+                  (truncate(info.title or info.id, max(10, w // 2)), "accent"),
+                  ("  │ ", "rule"), (f"{info.source}@{info.profile}", "accent2"),
+                  ("  │ ", "rule"), (f"{info.msgs} msgs", "dim"),
+                  ("  │ ", "rule"), (f"↑{fmt_tokens(info.inp)} ↓{fmt_tokens(info.out)}", "dim")]
+        if info.model:
+            header += [("  │ ", "rule"), (truncate(info.model, 30), "dim")]
+        frame.pad_to(y0, x)
+        frame.append(y0, header)
+
+        if tail is None or not tail.items:
+            frame.pad_to(y0 + 2, x + 2)
+            frame.append(y0 + 2, [("(no messages recorded for this session yet)", "dim")])
+            return
+
+        lines: list[tuple[str, str]] = []
+        for ts, role, tool, content in reversed(tail.items):
+            style = {"user": "info", "assistant": "", "tool": "dim",
+                     "system": "dim"}.get(role, "dim")
+            stamp = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "--:--:--"
+            label = f"{stamp}  {role}{('/' + tool) if tool else ''}"
+            # One tool dump can be thousands of characters; without a cap it
+            # would swallow the pane and hide the conversation.
+            body = wrap(content or "(empty)", max(8, w - 3))
+            elided = len(body) - MAX_MSG_LINES
+            if elided > 0:
+                body = body[:MAX_MSG_LINES]
+            for piece in reversed(body):
+                lines.append((f"  {piece}", style))
+            if elided > 0:
+                lines.insert(len(lines) - len(body), (f"  … +{elided} more lines", "dim"))
+            lines.append((label, "accent2" if role == "user" else "dim"))
+            if len(lines) > h * 2:
+                break
+        lines.reverse()
+        visible = lines[-(h - 1):]
+        pad = (h - 1) - len(visible)
+        for i, (text, style) in enumerate(visible):
+            row_y = y0 + 1 + pad + i
+            frame.pad_to(row_y, x)
+            frame.append(row_y, [(truncate(text, w), style)])
+
+    def _draw_picker(self, frame: Frame, width: int, height: int) -> None:
+        """Full-screen switcher. Instances first — a session with a live
+        process or unfinished cards — and boards apart, because a board is not
+        an instance: it is every instance's work seen together."""
+        frame.put(0, [(" HERMES-MON — switch instance ".ljust(width), "badge")])
+        live = [c for c in self.contexts if c.kind == "session"]
+        boards = [c for c in self.contexts if c.kind == "board"]
+        frame.put(2, [(f"  {len(live)} running instance(s)", "dim"),
+                      ("  ·  a board shows every instance's work together", "dim")])
+
+        y = 4
+        section_drawn = False
+        for idx, ctx in enumerate(self.contexts):
+            if y > height - 3:
+                frame.put(y, [(f"   … and {len(self.contexts) - idx} more", "dim")])
+                break
+            if ctx.kind == "board" and not section_drawn:
+                frame.put(y, [("  ── boards ", "dim"),
+                              ("─" * max(0, width - 14), "rule")])
+                y += 2
+                section_drawn = True
+            elif idx == 0:
+                frame.put(y, [("  ── instances ", "dim"),
+                              ("─" * max(0, width - 17), "rule")])
+                y += 2
+
+            selected = idx == self.picker_sel
+            current = ctx.key == self.context.key
+            row = [(" ▶ " if selected else "   ", "accent"),
+                   (f"{idx + 1}. " if idx < 9 else "   ", "dim"),
+                   (ctx.label, "accent" if selected else "accent2")]
+            if ctx.kind == "session":
+                row.append((f"  pid {ctx.pid}" if ctx.pid else "  (process gone)",
+                            "run" if ctx.pid else "warn"))
+                if ctx.cards:
+                    row.append((f"  {ctx.cards} cards", "info"))
+                row.append((f"  {ctx.session.msgs} msgs", "dim"))
+                row.append((f"  ↓{fmt_tokens(ctx.session.out)}", "dim"))
+            else:
+                row.append((f"  {ctx.board.running} running", "run" if ctx.board.running else "dim"))
+                row.append((f"  {ctx.board.pending} planned", "dim"))
+            if current:
+                row.append(("   ← current", "ok"))
+            frame.put(y, row)
+            frame.put(y + 1, [("      ", ""), (truncate(ctx.detail, width - 8), "dim")])
+            y += 3
+
+    def _draw_events(self, frame: Frame, y0: int, h: int, w: int) -> None:
+        frame.put(y0, [(" ▌ EVENTS ", "title"), ("─" * max(0, w - 10), "rule")])
+        if h >= 3:
+            frame.put(y0 + 1, [("  TIME      KIND            CARD         DETAIL", "dim")])
+            first, room = y0 + 2, h - 2
+        else:
+            first, room = y0 + 1, h - 1
+        for i, (ts, task_id, kind, payload) in enumerate(list(self.events)[-room:]):
+            style = {"completed": "ok", "done": "ok", "promoted": "info",
+                     "claimed": "run", "spawned": "run", "assigned": "info",
+                     "model_override_set": "warn", "reclaimed": "warn",
+                     "commented": "dim", "blocked": "bad", "crashed": "bad",
+                     "gave_up": "bad", "timed_out": "bad", "failed": "bad",
+                     "protocol_violation": "bad"}.get(kind, "")
+            short = task_id[2:10] if task_id.startswith("t_") else task_id[:8]
+            frame.put(first + i, [
+                (f"  {time.strftime('%H:%M:%S', time.localtime(ts))}  ", "dim"),
+                (f"{truncate(kind, 15):<15} ", style),
+                (f"{short:<12} ", "accent2"),
+                (truncate(payload, max(0, w - 42)), "dim"),
+            ])
+
+    def _draw_keys(self, frame: Frame, height: int, width: int) -> None:
+        if self.status_msg:
+            frame.put(height - 1, [(truncate(f"  {self.status_msg}".ljust(width), width), "keys")])
+            return
+        if self.picker_open:
+            shortcuts = [("↑↓", "select"), ("⏎", "open"), ("s", "cancel")]
+        else:
+            shortcuts = [("q", "quit"), ("s", "switch")]
+            if self.context.kind == "session":
+                shortcuts.append(("t", "chat" if not self.chat_view else "work"))
+            shortcuts += [("[]", "scroll cards"), ("d", "done"), ("p", "profile"), ("b", "cards"),
+                          ("i", "processes"), ("e", "events"), ("1-9", "single")]
+        row: list[tuple[str, str]] = [("  ", "")]
+        for key, label in shortcuts:
+            chunk = display_width(f" {key} {label}  ")
+            if display_width("".join(t for t, _ in row)) + chunk > width - 22:
+                break
+            row.append((f" {key} ", "key"))
+            row.append((f" {label}  ", "dim"))
+        stamp = f" hermes-mon v{VERSION} "
+        gap = width - display_width("".join(t for t, _ in row)) - display_width(stamp)
+        row.append((" " * max(0, gap), ""))
+        row.append((stamp, "dim"))
+        frame.put(height - 1, row)
+
+    # ---- keyboard ----
+    def handle_key(self, key: int) -> bool:
+        """False to quit."""
+        if self.picker_open:
+            return self._handle_picker_key(key)
+        running = self.running()
+        # ESC is deliberately NOT a quit key: with non-blocking reads an arrow
+        # press arrives as ESC [ A and the ESC can be read on its own, which
+        # would close the monitor (or the picker) by accident.
+        if key in (ord("q"), ord("Q")):
+            return False
+        if key in (ord("s"), ord("S")):
+            self.picker_open = True
+            self.picker_sel = next((i for i, c in enumerate(self.contexts)
+                                    if c.key == self.context.key), 0)
+        elif key in (ord("t"), ord("T")):
+            if self.context.kind == "session":
+                self.chat_view = not self.chat_view
+        elif key in (ord("f"), ord("F"), ord(" ")):
+            self.follow = not self.follow
+            if self.follow:
+                self.scroll.clear()
+        elif key in (ord("b"), ord("B")):
+            self.show_sidebar = not self.show_sidebar
+        elif key in (ord("e"), ord("E")):
+            self.show_events = not self.show_events
+        elif key in (ord("d"), ord("D")):
+            self.reader.include_done = not self.reader.include_done
+            self.refresh()
+        elif key in (ord("p"), ord("P")):
+            # all → profile 1 → profile 2 → … → all
+            options: list[str | None] = [None, *self.profiles]
+            try:
+                idx = options.index(self.profile_filter)
+            except ValueError:
+                idx = 0
+            self.profile_filter = options[(idx + 1) % len(options)]
+            self.zoom = None
+            self.focus = 0
+        elif key == ord("["):
+            self.sidebar_scroll = max(0, self.sidebar_scroll - 3)
+        elif key == ord("]"):
+            self.sidebar_scroll += 3
+        elif key in (ord("i"), ord("I")):
+            self.show_instances = not self.show_instances
+        elif key == ord("\t"):
+            if running:
+                self.focus = (self.focus + 1) % len(running)
+        elif ord("1") <= key <= ord("9"):
+            idx = key - ord("1")
+            self.zoom = idx if idx < len(running) else None
+        elif key == ord("0"):
+            self.zoom = None
+        elif key in (curses.KEY_UP, curses.KEY_PPAGE, curses.KEY_DOWN, curses.KEY_NPAGE):
+            target = None
+            if self.zoom is not None and self.zoom < len(running):
+                target = running[self.zoom]
+            elif running:
+                target = running[min(self.focus, len(running) - 1)]
+            if target:
+                step = 1 if key in (curses.KEY_UP, curses.KEY_DOWN) else 10
+                delta = step if key in (curses.KEY_UP, curses.KEY_PPAGE) else -step
+                new = max(0, self.scroll.get(target.id, 0) + delta)
+                self.scroll[target.id] = new
+                self.follow = new == 0
+        return True
+
+    def _open(self, ctx: Context) -> None:
+        """Open a context. A session that never created cards has nothing to
+        show as work, so it opens straight into its conversation."""
+        self.switch_to(ctx)
+        self.chat_view = ctx.kind == "session" and not self.tasks
+
+    def _handle_picker_key(self, key: int) -> bool:
+        total = len(self.contexts)
+        if key in (ord("q"), ord("Q"), ord("s"), ord("S")):
+            self.picker_open = False
+        elif key in (curses.KEY_UP, ord("k")) and total:
+            self.picker_sel = (self.picker_sel - 1) % total
+        elif key in (curses.KEY_DOWN, ord("j")) and total:
+            self.picker_sel = (self.picker_sel + 1) % total
+        elif key in (curses.KEY_ENTER, 10, 13) and total:
+            self.picker_open = False
+            self._open(self.contexts[self.picker_sel])
+        elif ord("1") <= key <= ord("9") and key - ord("1") < total:
+            self.picker_open = False
+            self._open(self.contexts[key - ord("1")])
+        return True
+
+
+# ── Styles ───────────────────────────────────────────────────────────────
+STYLES: dict[str, int] = {}
+
+# Hermes amber: #ffbd38 (dashboard) and #d4b348 (kanban plugin). In 256
+# colours those are 214 and 179; with 8 colours plain yellow has to do.
+AMBER, GOLD, GREEN, RED, GRAY, CYAN, MAGENTA = 214, 179, 78, 203, 244, 80, 177
+
+
+def init_styles(no_color: bool = False) -> None:
+    """256 colours when the terminal can do it, degrading to the classic 8.
+    NO_COLOR and --no-color leave it monochrome."""
+    plain = {k: curses.A_NORMAL for k in (
+        "", "dim", "bad", "warn", "ok", "run", "info", "review", "accent", "accent2",
+        "rule", "title", "badge", "key", "panehdr", "panehdrsel", "keys")}
+    plain.update({"title": curses.A_BOLD, "dim": curses.A_DIM,
+                  "accent": curses.A_BOLD, "keys": curses.A_REVERSE,
+                  "badge": curses.A_REVERSE | curses.A_BOLD, "key": curses.A_REVERSE,
+                  "panehdr": curses.A_REVERSE | curses.A_DIM,
+                  "panehdrsel": curses.A_REVERSE | curses.A_BOLD})
+    if no_color:
+        STYLES.update(plain)
+        return
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        rich = curses.COLORS >= 256
+    except curses.error:
+        STYLES.update(plain)
+        return
+
+    amber, gold = (AMBER, GOLD) if rich else (curses.COLOR_YELLOW, curses.COLOR_YELLOW)
+    green = GREEN if rich else curses.COLOR_GREEN
+    red = RED if rich else curses.COLOR_RED
+    gray = GRAY if rich else curses.COLOR_WHITE
+    cyan = CYAN if rich else curses.COLOR_CYAN
+    magenta = MAGENTA if rich else curses.COLOR_MAGENTA
+    try:
+        for idx, fg in enumerate((amber, gold, green, red, gray, cyan), start=1):
+            curses.init_pair(idx, fg, -1)
+        curses.init_pair(7, curses.COLOR_BLACK, amber)   # bars: black on amber
+        curses.init_pair(8, magenta, -1)
+    except curses.error:
+        STYLES.update(plain)
+        return
+
+    c = curses.color_pair
+    STYLES.update({
+        "": curses.A_NORMAL,
+        "dim": c(5) | curses.A_DIM,
+        "rule": c(5) | curses.A_DIM,
+        "bad": c(4) | curses.A_BOLD,
+        "warn": c(1),
+        "ok": c(3),
+        "run": c(1) | curses.A_BOLD,
+        "info": c(6),
+        "review": c(8),
+        "accent": c(1) | curses.A_BOLD,
+        "accent2": c(2),
+        "title": c(1) | curses.A_BOLD,
+        "badge": c(7) | curses.A_BOLD,
+        "key": c(7) | curses.A_BOLD,
+        "keys": c(2) | curses.A_REVERSE,
+        "panehdr": c(2) | curses.A_DIM,
+        "panehdrsel": c(7) | curses.A_BOLD,
+    })
+
+
+# ── Board picker ─────────────────────────────────────────────────────────
+def pick_board(stdscr, choices: list[BoardChoice], no_color: bool) -> BoardChoice | None:
+    """Startup picker. You choose a BOARD, not an instance: profiles share a
+    board on purpose, so two different Hermes processes usually land in the
+    same place. That is why each row lists who is attached."""
+    curses.curs_set(0)
+    init_styles(no_color)
+    stdscr.nodelay(False)
+    sel = 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        def line(y: int, text: str, style: str = "", fill: bool = False) -> None:
+            if 0 <= y < h:
+                # Truncate BEFORE padding: the other way round the padding
+                # overflows the width and the bar gets an ellipsis.
+                body = truncate(text, w - 1)
+                try:
+                    stdscr.addstr(y, 0, body.ljust(w - 1) if fill else body,
+                                  STYLES.get(style, 0))
+                except curses.error:
+                    pass
+
+        line(0, " HERMES-MON — which board do you want to monitor? ", "badge", fill=True)
+        line(2, "  Boards are shared between profiles, so several Hermes", "dim")
+        line(3, "  instances usually work on the SAME board.", "dim")
+
+        y = 5
+        for i, choice in enumerate(choices):
+            marker = "▶" if i == sel else " "
+            style = "accent" if i == sel else ""
+            line(y, f" {marker} {i + 1}. board {choice.slug}", style)
+            line(y + 1, f"      {choice.db}", "dim")
+            line(y + 2, f"      {choice.running} running · {choice.pending} planned · "
+                        f"{choice.counts.get('done', 0)} done",
+                 "accent2" if i == sel else "dim")
+            if choice.instances:
+                who = "  ".join(
+                    f"{KIND_GLYPH.get(inst.kind, '·')}{inst.pid} {inst.kind}"
+                    f"{'/' + inst.profile if inst.profile else ''}"
+                    for inst in choice.instances[:4])
+                extra = f"  (+{len(choice.instances) - 4})" if len(choice.instances) > 4 else ""
+                line(y + 3, f"      {who}{extra}", "dim")
+            else:
+                line(y + 3, "      (no Hermes process attached right now)", "dim")
+            y += 5
+
+        line(h - 1, "  ↑↓ select ▌ Enter open ▌ 1-9 shortcut ▌ q quit ", "keys", fill=True)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (ord("q"), ord("Q")):
+            return None
+        if key in (curses.KEY_UP, ord("k")):
+            sel = (sel - 1) % len(choices)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            sel = (sel + 1) % len(choices)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return choices[sel]
+        elif ord("1") <= key <= ord("9") and key - ord("1") < len(choices):
+            return choices[key - ord("1")]
+
+
+# ── Main loop ────────────────────────────────────────────────────────────
+ESCAPE_KEYS = {65: curses.KEY_UP, 66: curses.KEY_DOWN, 67: curses.KEY_RIGHT,
+               68: curses.KEY_LEFT, 53: curses.KEY_PPAGE, 54: curses.KEY_NPAGE}
+
+
+def decode_keys(raw: list[int]) -> list[int]:
+    """Turn a burst of getch() codes into logical keys.
+
+    With nodelay(True), getch() hands back the ESC of an arrow press before the
+    rest of the sequence has arrived, so curses never assembles it: the arrow
+    shows up as ESC, '[', 'B'. Reassembling here is what makes arrows work
+    instead of firing whatever ESC and 'B' happen to be bound to."""
+    out: list[int] = []
+    i = 0
+    while i < len(raw):
+        key = raw[i]
+        if key == 27 and i + 2 < len(raw) + 1 and i + 2 <= len(raw) - 1 and raw[i + 1] == 91:
+            code = raw[i + 2]
+            mapped = ESCAPE_KEYS.get(code)
+            if mapped is not None:
+                out.append(mapped)
+                i += 3
+                if code in (53, 54) and i < len(raw) and raw[i] == 126:
+                    i += 1          # swallow the trailing '~' of PgUp/PgDn
+                continue
+        if key != 27:               # a lone ESC is dropped, never a command
+            out.append(key)
+        i += 1
+    return out
+
+
+def run_curses(stdscr, mon: Monitor) -> None:
+    curses.curs_set(0)
+    init_styles(mon.no_color)
+    stdscr.nodelay(True)
+    last_refresh = 0.0
+    while True:
+        now = time.time()
+        if now - last_refresh >= mon.interval:
+            mon.refresh()
+            last_refresh = now
+        height, width = stdscr.getmaxyx()
+        frame = mon.build(width, height)
+        stdscr.erase()
+        for y, row in enumerate(frame.rows):
+            x = 0
+            for text, style in row:
+                if not text or x >= width:
+                    continue
+                text = truncate(text, width - x, "")
+                try:
+                    stdscr.addstr(y, x, text, STYLES.get(style, 0))
+                except curses.error:
+                    pass      # last cell of the screen: curses always complains
+                x += display_width(text)
+        stdscr.refresh()
+        raw: list[int] = []
+        key = stdscr.getch()
+        while key != -1:
+            raw.append(key)
+            key = stdscr.getch()
+        for logical in decode_keys(raw):
+            if not mon.handle_key(logical):
+                return
+        time.sleep(min(0.12, mon.interval))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="hermes-mon",
+        description="Live monitor for a Hermes kanban board: board state plus "
+                    "auto-tailed logs of every worker currently running.")
+    ap.add_argument("--board", help="board slug (default: the active board)")
+    ap.add_argument("--interval", type=float, default=1.0, help="seconds between refreshes (1.0)")
+    ap.add_argument("--profile", help="only cards owned by this profile ('p' cycles it live)")
+    ap.add_argument("--no-sidebar", action="store_true", help="hide the card list")
+    ap.add_argument("--events", action="store_true", help="start with the event feed open")
+    ap.add_argument("--processes", action="store_true",
+                    help="start with the Hermes process panel open")
+    ap.add_argument("--no-done", action="store_true",
+                    help="hide finished cards (shown by default; 'd' toggles)")
+    ap.add_argument("--archived", action="store_true", help="include archived cards too")
+    ap.add_argument("--no-tokens", action="store_true",
+                    help="do not read the profiles' state.db (no token counters)")
+    ap.add_argument("--no-instances", action="store_true",
+                    help="do not scan /proc for Hermes processes at all")
+    ap.add_argument("--no-color", action="store_true", help="monochrome (NO_COLOR works too)")
+    ap.add_argument("--pick", action="store_true",
+                    help="always ask which board to monitor, even with only one")
+    ap.add_argument("--no-pick", action="store_true", help="never ask: go to the active board")
+    ap.add_argument("--snapshot", action="store_true",
+                    help="print one frame as plain text and exit (for pipes and tests)")
+    ap.add_argument("--width", type=int, default=0, help="width for --snapshot")
+    ap.add_argument("--height", type=int, default=0, help="height for --snapshot")
+    ap.add_argument("--version", action="version", version=f"hermes-mon {VERSION}")
+    args = ap.parse_args()
+
+    # Picker: only when there is something to choose (or with --pick).
+    choice = None
+    if not args.board and not args.no_pick and not args.snapshot:
+        instances = [] if args.no_instances else scan_instances()
+        choices = discover_boards(instances)
+        if args.pick or len(choices) > 1:
+            if not choices:
+                print("hermes-mon: no kanban board found on this machine.")
+                return 1
+            choice = curses.wrapper(pick_board, choices,
+                                    args.no_color or bool(os.environ.get("NO_COLOR")))
+            if choice is None:
+                return 0
+
+    mon = Monitor(args, choice)
+    if not mon.db_path.exists():
+        print(f"hermes-mon: cannot find the board database: {mon.db_path}")
+        print("wrong board? try 'hermes kanban boards' and pass it with --board <slug>")
+        return 1
+
+    if args.snapshot:
+        size = os.get_terminal_size() if os.isatty(1) else os.terminal_size((120, 40))
+        mon.refresh()
+        time.sleep(0.15)
+        mon.refresh()
+        print(mon.build(args.width or size.columns, args.height or size.lines).as_text())
+        return 0
+
+    try:
+        curses.wrapper(run_curses, mon)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
