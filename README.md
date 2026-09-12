@@ -1,5 +1,7 @@
 # hermes-mon
 
+The report behind this tool: [Hermes multiagente en local](docs/hermes-multiagente.md) (ES).
+
 A live terminal monitor for [Hermes Agent](https://github.com/NousResearch/hermes-agent) kanban boards:
 what every instance is doing, right now, in one screen.
 
