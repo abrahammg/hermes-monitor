@@ -85,6 +85,17 @@ def _char_width(ch: str) -> int:
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
+_CONTROL = {c: " " for c in range(32)} | {127: " "}
+
+
+def sanitize(text: str) -> str:
+    """Strip control characters from anything that reaches the screen.
+
+    A newline inside a segment moves the cursor and corrupts the whole frame —
+    transcript messages carry them, so this is not hypothetical."""
+    return text.expandtabs(4).translate(_CONTROL)
+
+
 def display_width(text: str) -> int:
     return sum(_char_width(c) for c in text)
 
@@ -1081,7 +1092,7 @@ class Frame:
         for text, style in segments:
             if room <= 0:
                 break
-            piece = truncate(text, room, "")
+            piece = truncate(sanitize(text), room, "")
             if piece:
                 clipped.append((piece, style))
                 room -= display_width(piece)
@@ -1097,7 +1108,7 @@ class Frame:
         for text, style in segments:
             if room <= 0:
                 break
-            piece = truncate(text, room, "")
+            piece = truncate(sanitize(text), room, "")
             if piece:
                 self.rows[y].append((piece, style))
                 room -= display_width(piece)
@@ -1740,7 +1751,11 @@ class Monitor:
             label = f"{stamp}  {role}{('/' + tool) if tool else ''}"
             # One tool dump can be thousands of characters; without a cap it
             # would swallow the pane and hide the conversation.
-            body = wrap(content or "(empty)", max(8, w - 3))
+            # Messages are multi-line: split on the real newlines first, then
+            # wrap each paragraph to the pane.
+            body: list[str] = []
+            for paragraph in (content or "(empty)").split("\n"):
+                body.extend(wrap(paragraph, max(8, w - 3)) or [""])
             elided = len(body) - MAX_MSG_LINES
             if elided > 0:
                 body = body[:MAX_MSG_LINES]
