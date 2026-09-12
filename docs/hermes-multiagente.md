@@ -18,7 +18,9 @@ son los números que salieron, las trampas con las que me encontré y cómo mont
   con su propio contexto y su propio modelo. No es una demo, entrega código.
 - Los modelos no son intercambiables. En tareas de código, **DeepSeek V4 Flash entregó donde Qwen y GLM
   ni siquiera llegaron a escribir**, y a 2-3× de velocidad.
-- Bajar la temperatura de Qwen de 1.0 a 0.6 redujo la verborrea **4×** (2.300 → 579 tokens por llamada).
+- Bajar la temperatura de Qwen de 1.0 a 0.6 redujo la verborrea **4×** (2.300 → 579 tokens por llamada)
+  — pero es una desviación de lo que recomienda el fabricante, con un coste en calidad aún sin medir
+  (§3.5).
 
 **Lo que no compensa, o duele:**
 
@@ -35,13 +37,16 @@ son los números que salieron, las trampas con las que me encontré y cómo mont
 | perfil | modelo | endpoint | temp | papel |
 |---|---|---|---|---|
 | `orchestrator` | GLM-5.3-Flash-NVFP4 | Spark 80 | 0.4 | Trocea, enruta, verifica. No toca ficheros |
-| `qwen-coder` | Qwen3.8-27B-NVFP4 | Spark 31 | 0.6 | Coder principal |
+| `qwen-coder` | Qwen3.8-27B-NVFP4 | Spark 31 | 0.6 \* | Coder principal |
 | `deepseek-coder` | DeepSeek-V4-Flash | Spark 34 | 0.3 | Segundo coder / segunda opinión |
 | `reviewer` | DeepSeek-V4-Flash | Spark 34 | 0.1 | Revisión independiente, sin editar |
 | `vision` | Gemma-4-31B-IT | Spark 79 | 0.3 | Capturas y diagramas → hallazgos escritos |
 
 Cada perfil es un proceso Hermes independiente con su modelo, su sampling y sus toolsets. El revisor
 usa **un modelo distinto al que escribió el código** a propósito: que el autor no se revise a sí mismo.
+
+\* Las temperaturas de esta tabla son las que corríamos, no las recomendadas por cada fabricante.
+Qwen3.8 recomienda 1.0 en modo thinking y DeepSeek V4 Flash recomienda 1.0 para uso agéntico; ver §3.5.
 
 ---
 
@@ -191,9 +196,8 @@ razonamiento de cada mensaje.
 
 ### 3.5 El experimento de la temperatura
 
-Qwen venía con `temperature: 1.0`, que es el valor recomendado para su modo **sin** thinking; con
-thinking activado, Qwen recomienda 0.6. Lo bajé y comparé la métrica que no depende de la concurrencia
-—cuánto escribe por llamada:
+Qwen venía con `temperature: 1.0`. Lo bajé a 0.6 y comparé la métrica que no depende de la
+concurrencia —cuánto escribe por llamada:
 
 | | cards | tokens por llamada |
 |---|---|---|
@@ -205,7 +209,17 @@ card también bajaron (VA-7 en 16,6 m; LLM-BENCH-1 en 22,1 m, frente a los 33-11
 temperatura 1.0), aunque ahí influyen el tipo de tarea y la concurrencia, así que lo doy como
 indicio fuerte, no como prueba cerrada.
 
-Es el cambio con mejor relación esfuerzo/resultado de todo el fin de semana: una línea de configuración.
+**Aviso importante, y es una corrección sobre lo que creía al hacer la prueba:** 0.6 **no** es el valor
+recomendado. La [ficha de Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) recomienda para modo
+thinking `temperature 1.0, top_p 0.95, top_k 20, min_p 0.0` —exactamente la configuración de partida— y
+0.7 para el modo instruct sin thinking. Bajar a 0.6 es **desviarse de la especificación a cambio de 4×
+menos verborrea**. El efecto medido es real; lo que no está medido es qué se pierde en calidad en
+tareas difíciles, que es justo lo que el modelo recomienda proteger con temperatura alta.
+
+Lo mismo aplica al otro lado: la [ficha de DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
+recomienda `temperature 1.0` con `top_p 0.95` para escenarios agénticos, y nuestro perfil corría a 0.3
+—también muy por debajo— y aun así fue el más rápido y el más económico en tokens. Es decir: salirse de
+la recomendación no es automáticamente malo, pero **hay que medirlo, no suponerlo**.
 
 ### 3.6 Un detalle de infraestructura que importa
 
@@ -230,7 +244,10 @@ workers → 42 tok/s uno de ellos.
 1. **Elegid el modelo por tarea, no por benchmark general.** Para chat, cualquiera de los tres. Para
    código agéntico, DeepSeek V4 Flash fue entre 2× y 3× más rápido en reloj de pared, con la misma
    economía de tokens.
-2. **Bajad la temperatura a la recomendada del modelo en modo thinking.** 4× menos verborrea en Qwen.
+2. **Mirad la ficha del modelo antes de tocar el sampling.** Los dos modelos de este montaje corrían
+   por debajo de lo recomendado (Qwen a 1.0 está bien; DeepSeek debería estar a 1.0 y estaba a 0.3).
+   Bajar Qwen a 0.6 redujo la verborrea 4×, pero es una desviación deliberada con un coste en calidad
+   todavía sin medir.
 3. **Limitad la concurrencia por perfil.** Con `max_in_progress_per_profile: 2` cada worker va a ~40
    tok/s en vez de ~13. El trabajo total tarda parecido, pero la interactividad cambia por completo.
 4. **Vigilad el dispatcher.** Es el único fallo que he visto capaz de perder horas en silencio.
